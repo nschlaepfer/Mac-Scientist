@@ -29,11 +29,17 @@ Features:
     - Customizable research parameters (temperature, top_p, max_turns)
 
 Usage:
-    # Start with VLLM backend (recommended for faster inference)
+    # Start with VLLM backend (NVIDIA GPUs)
     python gradio_app.py --serving-mode vllm --vllm-url http://localhost:9999/v1
 
-    # Start with local backend (single GPU)
+    # Start with local backend (auto device detection: CUDA/MPS/CPU)
     python gradio_app.py --serving-mode local --model-path path/to/model
+
+    # Apple Silicon: Use MLX for native performance (recommended for M1/M2/M3)
+    python gradio_app.py --serving-mode mlx
+    
+    # Apple Silicon: Use MLX-LM server
+    python gradio_app.py --serving-mode mlx-server --mlx-server-url http://localhost:8080/v1
 
     # Enable public sharing
     python gradio_app.py --share --port 7777
@@ -43,6 +49,7 @@ import argparse
 import asyncio
 import atexit
 import os
+import platform
 import socket
 import subprocess
 import sys
@@ -56,6 +63,39 @@ import torch
 from logging_utils import setup_colored_logger
 
 logger = setup_colored_logger(__name__)
+
+
+def get_default_device() -> str:
+    """Get the optimal default device based on hardware."""
+    if torch.cuda.is_available():
+        return "cuda"
+    elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        return "mps"
+    else:
+        return "cpu"
+
+
+def is_apple_silicon() -> bool:
+    """Check if running on Apple Silicon."""
+    return (
+        platform.system() == "Darwin" 
+        and platform.machine() == "arm64"
+    )
+
+
+def get_system_memory_gb() -> float:
+    """Get total system memory in GB."""
+    try:
+        if platform.system() == "Darwin":
+            result = subprocess.run(
+                ["sysctl", "-n", "hw.memsize"],
+                capture_output=True,
+                text=True,
+            )
+            return int(result.stdout.strip()) / (1024**3)
+    except Exception:
+        pass
+    return 16.0
 
 # Global configuration (read-only after initialization, safe for concurrent access)
 serving_mode = None
@@ -352,8 +392,14 @@ def create_agent():
     Factory function that creates the appropriate agent type based on
     the global serving_mode configuration.
 
+    Supports:
+    - vllm: vLLM server (NVIDIA GPUs)
+    - mlx: MLX native inference (Apple Silicon)
+    - mlx-server: MLX-LM server
+    - local: HuggingFace Transformers (auto device detection)
+
     Returns:
-        VLLMDeepResearchAgent | SimpleDeepResearchAgent: Configured agent instance
+        Configured agent instance
     """
     if serving_mode == "vllm":
         from agent.vllm_agent import VLLMDeepResearchAgent
@@ -364,7 +410,27 @@ def create_agent():
             tool_config_path=agent_config["tool_config_path"],
             max_turns=agent_config["max_turns"],
         )
-    else:
+    
+    elif serving_mode == "mlx":
+        from agent.mlx_agent import MLXDeepResearchAgent
+
+        return MLXDeepResearchAgent(
+            model_path=agent_config["model_path"],
+            tool_config_path=agent_config["tool_config_path"],
+            max_turns=agent_config["max_turns"],
+        )
+    
+    elif serving_mode == "mlx-server":
+        from agent.mlx_agent import MLXServerAgent
+
+        return MLXServerAgent(
+            server_url=agent_config.get("mlx_server_url", "http://localhost:8080/v1"),
+            model_name=agent_config["model_path"],
+            tool_config_path=agent_config["tool_config_path"],
+            max_turns=agent_config["max_turns"],
+        )
+    
+    else:  # local
         from agent.simple_agent import SimpleDeepResearchAgent
 
         return SimpleDeepResearchAgent(
@@ -389,6 +455,29 @@ def get_session_id(request: gr.Request) -> str:
     if request and hasattr(request, "session_hash"):
         return request.session_hash
     return "default"
+
+
+def format_timeline_item(item_type: str, title: str, details: str = "", items: list = None) -> str:
+    """Format a single timeline item with proper styling."""
+    items_html = ""
+    if items:
+        items_html = "<ul>" + "".join(f"<li>{item}</li>" for item in items[:5])
+        if len(items) > 5:
+            items_html += f"<li>... and {len(items) - 5} more</li>"
+        items_html += "</ul>"
+    
+    return f"""
+<div class="timeline-item timeline-{item_type}">
+    <div class="timeline-dot"></div>
+    <div class="timeline-content">
+        <div class="timeline-title">{title}</div>
+        <div class="timeline-details">
+            {details}
+            {items_html}
+        </div>
+    </div>
+</div>
+"""
 
 
 async def research_stream(
@@ -423,16 +512,31 @@ async def research_stream(
     # Check if tool server is running
     status = get_tool_server_status()
     if not status["running"]:
-        error_msg = (
-            "❌ Tool server is not running! Please start it in the Setup tab first."
-        )
-        yield error_msg, error_msg
+        error_html = """
+<div class="timeline-item timeline-error">
+    <div class="timeline-dot"></div>
+    <div class="timeline-content">
+        <div class="timeline-title">⚠️ Tool Server Not Running</div>
+        <div class="timeline-details">
+            Please start the tool server in the Setup tab before conducting research.
+        </div>
+    </div>
+</div>
+        """
+        yield error_html, "❌ Tool server is not running. Please start it in the Setup tab."
         return
 
     logger.info(f"Starting research for session {session_id[:8]}...")
 
     agent = None
-    thinking_log = ""
+    timeline_items = []
+    
+    # Add initial "started" item
+    timeline_items.append(format_timeline_item(
+        "think",
+        "🚀 Research Started",
+        f"Analyzing your question and preparing search strategy..."
+    ))
 
     try:
         agent = create_agent()
@@ -449,38 +553,47 @@ async def research_stream(
 
             if update_type == "answer_found":
                 think = update.get("think", "")
-                if think:
-                    thinking_log += f"\n\n💭 **Thinking:**\n\n{think}\n"
-                thinking_log += "\n\n🔎 **Verifying answer...**\n"
-                yield thinking_log, ""
+                think_preview = (think[:200] + "...") if len(think) > 200 else think
+                timeline_items.append(format_timeline_item(
+                    "verify",
+                    "🔎 Verifying Answer",
+                    think_preview if think_preview else "Cross-referencing findings for accuracy..."
+                ))
+                yield "".join(timeline_items), ""
 
             elif update_type == "tool_call":
                 think = update.get("think", "")
-                if think:
-                    thinking_log += f"\n\n💭 **Thinking:**\n\n{think}\n"
-
                 tool_name = update["tool_name"]
+                
                 if tool_name == "web_search":
                     queries = update["queries"]
-                    thinking_log += (
-                        f"\n\n🔍 **Searching:** {len(queries)} querie(s)\n\n"
-                    )
-                    for q in queries:
-                        thinking_log += f"- {q}\n"
+                    timeline_items.append(format_timeline_item(
+                        "search",
+                        f"🔍 Web Search ({len(queries)} queries)",
+                        "",
+                        queries
+                    ))
 
                 elif tool_name == "web_read":
                     urls = update["urls"]
-                    thinking_log += f"\n\n📖 **Reading:** {len(urls)} URL(s)\n\n"
-                    for url in urls[:3]:
-                        thinking_log += f"- {url}\n"
-                    if len(urls) > 3:
-                        thinking_log += f"- ... and {len(urls) - 3} more\n"
+                    # Truncate URLs for display
+                    display_urls = [u[:60] + "..." if len(u) > 60 else u for u in urls]
+                    timeline_items.append(format_timeline_item(
+                        "read",
+                        f"📖 Reading Sources ({len(urls)} pages)",
+                        "",
+                        display_urls
+                    ))
 
-                yield thinking_log, ""
+                yield "".join(timeline_items), ""
 
             elif update_type == "done":
-                thinking_log += "\n\n✅ **Research completed!**\n"
-                yield thinking_log, update["answer"]
+                timeline_items.append(format_timeline_item(
+                    "done",
+                    "✅ Research Complete",
+                    "Successfully synthesized findings into a comprehensive answer."
+                ))
+                yield "".join(timeline_items), update["answer"]
                 break
 
             elif update_type == "error":
@@ -488,22 +601,34 @@ async def research_stream(
                     f"Research error for session {session_id[:8]}: {update['message']}",
                     exc_info=True,
                 )
-                thinking_log += "\n\n❌ **Error occurred during research.**\n"
-                yield thinking_log, "❌ Error occurred during research."
+                timeline_items.append(format_timeline_item(
+                    "error",
+                    "❌ Error Occurred",
+                    f"An error occurred during research. Please try again."
+                ))
+                yield "".join(timeline_items), "❌ Error occurred during research."
                 break
 
     except asyncio.CancelledError:
         logger.info(f"Research cancelled for session {session_id[:8]}")
         if agent:
             await agent.cleanup_tool_instances()
-        thinking_log += "\n\n❌ **Cancelled by user**\n"
-        yield thinking_log, "❌ Research cancelled by user."
+        timeline_items.append(format_timeline_item(
+            "error",
+            "🛑 Cancelled",
+            "Research was cancelled by user."
+        ))
+        yield "".join(timeline_items), "❌ Research cancelled by user."
         raise
 
     except Exception as e:
         logger.error(f"Research error for session {session_id[:8]}: {e}", exc_info=True)
-        thinking_log += "\n\n❌ **Unexpected error occurred.**"
-        yield thinking_log, "❌ Error occurred during research."
+        timeline_items.append(format_timeline_item(
+            "error",
+            "❌ Unexpected Error",
+            f"Something went wrong. Please try again."
+        ))
+        yield "".join(timeline_items), "❌ Error occurred during research."
 
     finally:
         if session_id in running_tasks:
@@ -544,7 +669,7 @@ def cancel_research(request: gr.Request):
 def create_demo():
     """Create and configure the Gradio interface.
 
-    Builds a multi-tab interface with:
+    Builds a premium multi-tab interface with:
     - Setup tab: API configuration and tool server management
     - Research tab: Question input and real-time progress display
     - About tab: Documentation and usage tips
@@ -552,234 +677,1006 @@ def create_demo():
     Returns:
         gr.Blocks: Configured Gradio interface ready to launch
     """
-    serving_mode_display = "VLLM" if serving_mode == "vllm" else "Local"
+    # Build display strings
+    mode_display_map = {
+        "vllm": "vLLM Server",
+        "mlx": "MLX (Apple Silicon)",
+        "mlx-server": "MLX-LM Server",
+        "local": f"Local ({agent_config.get('device', 'auto').upper()})",
+    }
+    serving_mode_display = mode_display_map.get(serving_mode, serving_mode.upper())
+    
+    # Platform badges
+    platform_badge = ""
+    mem_badge = ""
+    if is_apple_silicon():
+        mem_gb = get_system_memory_gb()
+        platform_badge = "Apple Silicon"
+        mem_badge = f"{mem_gb:.0f}GB"
 
-    with gr.Blocks(
-        title="Pokee Deep Research Agent",
-        css="""
-        .progress-box {
-            height: 500px !important;
-            max-height: 500px !important;
-            overflow-y: auto !important;
-            border: 2px solid var(--border-color-primary) !important;
-            border-radius: 8px !important;
-            padding: 16px !important;
-            background-color: var(--background-fill-secondary) !important;
-        }
-        .progress-box::-webkit-scrollbar {
+    # Premium CSS with dark scientific theme
+    custom_css = """
+    /* ===== IMPORTS ===== */
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+    
+    /* ===== ROOT VARIABLES ===== */
+    :root {
+        --bg-primary: #0a0a0f;
+        --bg-secondary: #12121a;
+        --bg-tertiary: #1a1a24;
+        --bg-card: rgba(26, 26, 36, 0.8);
+        --bg-glass: rgba(255, 255, 255, 0.03);
+        --border-subtle: rgba(255, 255, 255, 0.08);
+        --border-glow: rgba(99, 102, 241, 0.4);
+        --text-primary: #f1f5f9;
+        --text-secondary: #94a3b8;
+        --text-muted: #64748b;
+        --accent-primary: #6366f1;
+        --accent-secondary: #8b5cf6;
+        --accent-glow: rgba(99, 102, 241, 0.2);
+        --success: #10b981;
+        --warning: #f59e0b;
+        --error: #ef4444;
+        --gradient-primary: linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #a855f7 100%);
+        --gradient-dark: linear-gradient(180deg, #0a0a0f 0%, #12121a 100%);
+        --shadow-glow: 0 0 40px rgba(99, 102, 241, 0.15);
+        --radius-sm: 8px;
+        --radius-md: 12px;
+        --radius-lg: 16px;
+        --radius-xl: 24px;
+    }
+
+    /* ===== BASE STYLES ===== */
+    .gradio-container {
+        background: var(--gradient-dark) !important;
+        font-family: 'Space Grotesk', -apple-system, BlinkMacSystemFont, sans-serif !important;
+        max-width: 1400px !important;
+    }
+    
+    .dark {
+        --background-fill-primary: var(--bg-primary) !important;
+        --background-fill-secondary: var(--bg-secondary) !important;
+    }
+
+    /* ===== HEADER HERO ===== */
+    .hero-header {
+        background: linear-gradient(135deg, rgba(99, 102, 241, 0.1) 0%, rgba(139, 92, 246, 0.05) 100%);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-xl);
+        padding: 2.5rem;
+        margin-bottom: 1.5rem;
+        position: relative;
+        overflow: hidden;
+    }
+    
+    .hero-header::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 1px;
+        background: var(--gradient-primary);
+        opacity: 0.6;
+    }
+    
+    .hero-header h1 {
+        font-size: 2.5rem !important;
+        font-weight: 700 !important;
+        background: var(--gradient-primary);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+        margin: 0 0 0.5rem 0 !important;
+        letter-spacing: -0.02em;
+    }
+    
+    .hero-subtitle {
+        color: var(--text-secondary);
+        font-size: 1.1rem;
+        margin: 0;
+    }
+    
+    .hero-badges {
+        display: flex;
+        gap: 0.75rem;
+        margin-top: 1.25rem;
+        flex-wrap: wrap;
+    }
+    
+    .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
+        padding: 0.4rem 0.85rem;
+        background: var(--bg-glass);
+        border: 1px solid var(--border-subtle);
+        border-radius: 100px;
+        font-size: 0.8rem;
+        font-weight: 500;
+        color: var(--text-secondary);
+        backdrop-filter: blur(10px);
+    }
+    
+    .badge-accent {
+        background: rgba(99, 102, 241, 0.15);
+        border-color: rgba(99, 102, 241, 0.3);
+        color: #a5b4fc;
+    }
+    
+    .badge-success {
+        background: rgba(16, 185, 129, 0.15);
+        border-color: rgba(16, 185, 129, 0.3);
+        color: #6ee7b7;
+    }
+
+    /* ===== TABS ===== */
+    .tabs {
+        border: none !important;
+        background: transparent !important;
+    }
+    
+    .tabitem {
+        background: transparent !important;
+        border: none !important;
+        padding: 0 !important;
+    }
+    
+    button.tab-nav {
+        background: var(--bg-glass) !important;
+        border: 1px solid var(--border-subtle) !important;
+        border-radius: var(--radius-md) !important;
+        padding: 0.85rem 1.5rem !important;
+        margin-right: 0.5rem !important;
+        font-family: 'Space Grotesk', sans-serif !important;
+        font-weight: 500 !important;
+        font-size: 0.95rem !important;
+        color: var(--text-secondary) !important;
+        transition: all 0.2s ease !important;
+    }
+    
+    button.tab-nav:hover {
+        background: rgba(99, 102, 241, 0.1) !important;
+        border-color: rgba(99, 102, 241, 0.3) !important;
+        color: var(--text-primary) !important;
+    }
+    
+    button.tab-nav.selected {
+        background: rgba(99, 102, 241, 0.15) !important;
+        border-color: var(--accent-primary) !important;
+        color: var(--text-primary) !important;
+        box-shadow: 0 0 20px rgba(99, 102, 241, 0.2) !important;
+    }
+
+    /* ===== CARDS ===== */
+    .glass-card {
+        background: var(--bg-card) !important;
+        backdrop-filter: blur(20px) !important;
+        border: 1px solid var(--border-subtle) !important;
+        border-radius: var(--radius-lg) !important;
+        padding: 1.5rem !important;
+        transition: all 0.3s ease !important;
+    }
+    
+    .glass-card:hover {
+        border-color: rgba(99, 102, 241, 0.3) !important;
+        box-shadow: var(--shadow-glow) !important;
+    }
+    
+    .card-header {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        margin-bottom: 1.25rem;
+        padding-bottom: 1rem;
+        border-bottom: 1px solid var(--border-subtle);
+    }
+    
+    .card-icon {
+        width: 40px;
+        height: 40px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: var(--gradient-primary);
+        border-radius: var(--radius-md);
+        font-size: 1.25rem;
+    }
+    
+    .card-title {
+        font-size: 1.1rem;
+        font-weight: 600;
+        color: var(--text-primary);
+        margin: 0;
+    }
+    
+    .card-subtitle {
+        font-size: 0.85rem;
+        color: var(--text-muted);
+        margin: 0;
+    }
+
+    /* ===== INPUTS ===== */
+    .input-group label {
+        font-family: 'Space Grotesk', sans-serif !important;
+        font-weight: 500 !important;
+        font-size: 0.9rem !important;
+        color: var(--text-secondary) !important;
+        margin-bottom: 0.5rem !important;
+    }
+    
+    input[type="text"], input[type="password"], textarea {
+        background: var(--bg-tertiary) !important;
+        border: 1px solid var(--border-subtle) !important;
+        border-radius: var(--radius-md) !important;
+        padding: 0.85rem 1rem !important;
+        font-family: 'JetBrains Mono', monospace !important;
+        font-size: 0.9rem !important;
+        color: var(--text-primary) !important;
+        transition: all 0.2s ease !important;
+    }
+    
+    input[type="text"]:focus, input[type="password"]:focus, textarea:focus {
+        border-color: var(--accent-primary) !important;
+        box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15) !important;
+        outline: none !important;
+    }
+    
+    input::placeholder, textarea::placeholder {
+        color: var(--text-muted) !important;
+    }
+
+    /* ===== BUTTONS ===== */
+    .primary-btn, button.primary {
+        background: var(--gradient-primary) !important;
+        border: none !important;
+        border-radius: var(--radius-md) !important;
+        padding: 0.85rem 1.75rem !important;
+        font-family: 'Space Grotesk', sans-serif !important;
+        font-weight: 600 !important;
+        font-size: 0.95rem !important;
+        color: white !important;
+        cursor: pointer !important;
+        transition: all 0.2s ease !important;
+        box-shadow: 0 4px 15px rgba(99, 102, 241, 0.3) !important;
+    }
+    
+    .primary-btn:hover, button.primary:hover {
+        transform: translateY(-2px) !important;
+        box-shadow: 0 6px 25px rgba(99, 102, 241, 0.4) !important;
+    }
+    
+    .secondary-btn, button.secondary {
+        background: var(--bg-glass) !important;
+        border: 1px solid var(--border-subtle) !important;
+        border-radius: var(--radius-md) !important;
+        padding: 0.85rem 1.75rem !important;
+        font-family: 'Space Grotesk', sans-serif !important;
+        font-weight: 500 !important;
+        color: var(--text-secondary) !important;
+        transition: all 0.2s ease !important;
+    }
+    
+    .secondary-btn:hover, button.secondary:hover {
+        background: rgba(255, 255, 255, 0.05) !important;
+        border-color: var(--text-muted) !important;
+        color: var(--text-primary) !important;
+    }
+    
+    .danger-btn, button.stop {
+        background: rgba(239, 68, 68, 0.15) !important;
+        border: 1px solid rgba(239, 68, 68, 0.3) !important;
+        color: #fca5a5 !important;
+    }
+    
+    .danger-btn:hover, button.stop:hover {
+        background: rgba(239, 68, 68, 0.25) !important;
+        border-color: rgba(239, 68, 68, 0.5) !important;
+    }
+
+    /* ===== STATUS INDICATORS ===== */
+    .status-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.6rem 1rem;
+        border-radius: 100px;
+        font-weight: 500;
+        font-size: 0.9rem;
+    }
+    
+    .status-running {
+        background: rgba(16, 185, 129, 0.15);
+        border: 1px solid rgba(16, 185, 129, 0.3);
+        color: #6ee7b7;
+    }
+    
+    .status-stopped {
+        background: rgba(239, 68, 68, 0.15);
+        border: 1px solid rgba(239, 68, 68, 0.3);
+        color: #fca5a5;
+    }
+    
+    .status-dot {
             width: 8px;
-        }
-        .progress-box::-webkit-scrollbar-track {
-            background: var(--background-fill-primary);
-            border-radius: 4px;
-        }
-        .progress-box::-webkit-scrollbar-thumb {
-            background: var(--border-color-primary);
-            border-radius: 4px;
-        }
-        .progress-box::-webkit-scrollbar-thumb:hover {
-            background: var(--border-color-accent);
-        }
-        .status-indicator {
-            font-size: 1.2em;
-            font-weight: bold;
-            padding: 10px;
-            border-radius: 5px;
+        height: 8px;
+        border-radius: 50%;
+        animation: pulse 2s infinite;
+    }
+    
+    .status-dot-green {
+        background: var(--success);
+        box-shadow: 0 0 10px var(--success);
+    }
+    
+    .status-dot-red {
+        background: var(--error);
+        box-shadow: 0 0 10px var(--error);
+        animation: none;
+    }
+    
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.5; }
+    }
+
+    /* ===== PROGRESS TIMELINE ===== */
+    .research-progress {
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-lg);
+        padding: 1.5rem;
+        min-height: 450px;
+        max-height: 550px;
+        overflow-y: auto;
+        font-family: 'Space Grotesk', sans-serif;
+    }
+    
+    .research-progress::-webkit-scrollbar {
+        width: 6px;
+    }
+    
+    .research-progress::-webkit-scrollbar-track {
+        background: transparent;
+    }
+    
+    .research-progress::-webkit-scrollbar-thumb {
+        background: var(--border-subtle);
+        border-radius: 3px;
+    }
+    
+    .research-progress::-webkit-scrollbar-thumb:hover {
+        background: var(--text-muted);
+    }
+    
+    .progress-empty {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        height: 100%;
+        color: var(--text-muted);
             text-align: center;
         }
-        """,
+    
+    .progress-empty-icon {
+        font-size: 3rem;
+        margin-bottom: 1rem;
+        opacity: 0.5;
+    }
+    
+    .timeline-item {
+        position: relative;
+        padding-left: 2rem;
+        padding-bottom: 1.5rem;
+        border-left: 2px solid var(--border-subtle);
+        margin-left: 0.5rem;
+    }
+    
+    .timeline-item:last-child {
+        border-left-color: transparent;
+        padding-bottom: 0;
+    }
+    
+    .timeline-dot {
+        position: absolute;
+        left: -7px;
+        top: 0;
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        background: var(--accent-primary);
+        border: 2px solid var(--bg-secondary);
+    }
+    
+    .timeline-search .timeline-dot { background: #3b82f6; }
+    .timeline-read .timeline-dot { background: #8b5cf6; }
+    .timeline-think .timeline-dot { background: #f59e0b; }
+    .timeline-verify .timeline-dot { background: #10b981; }
+    .timeline-done .timeline-dot { background: #10b981; box-shadow: 0 0 10px rgba(16, 185, 129, 0.5); }
+    .timeline-error .timeline-dot { background: #ef4444; }
+    
+    .timeline-content {
+        background: var(--bg-glass);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-md);
+        padding: 1rem;
+    }
+    
+    .timeline-title {
+        font-weight: 600;
+        font-size: 0.95rem;
+        color: var(--text-primary);
+        margin-bottom: 0.5rem;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+    
+    .timeline-details {
+        font-size: 0.85rem;
+        color: var(--text-secondary);
+        font-family: 'JetBrains Mono', monospace;
+    }
+    
+    .timeline-details ul {
+        margin: 0.5rem 0 0 0;
+        padding-left: 1.25rem;
+    }
+    
+    .timeline-details li {
+        margin-bottom: 0.25rem;
+        word-break: break-all;
+    }
+
+    /* ===== ANSWER BOX ===== */
+    .answer-container {
+        margin-top: 1rem;
+    }
+    
+    .answer-box {
+        background: linear-gradient(135deg, rgba(16, 185, 129, 0.1) 0%, rgba(99, 102, 241, 0.05) 100%);
+        border: 1px solid rgba(16, 185, 129, 0.2);
+        border-radius: var(--radius-lg);
+        padding: 1.5rem;
+    }
+    
+    .answer-label {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        font-weight: 600;
+        color: #6ee7b7;
+        margin-bottom: 0.75rem;
+        font-size: 0.9rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+
+    /* ===== ACCORDION ===== */
+    .accordion {
+        border: 1px solid var(--border-subtle) !important;
+        border-radius: var(--radius-md) !important;
+        background: var(--bg-glass) !important;
+        margin-top: 1rem !important;
+    }
+    
+    .accordion > button {
+        background: transparent !important;
+        border: none !important;
+        padding: 1rem !important;
+        font-family: 'Space Grotesk', sans-serif !important;
+        font-weight: 500 !important;
+        color: var(--text-secondary) !important;
+    }
+    
+    .accordion > button:hover {
+        color: var(--text-primary) !important;
+    }
+
+    /* ===== SLIDER ===== */
+    input[type="range"] {
+        accent-color: var(--accent-primary) !important;
+    }
+    
+    .slider-label {
+        font-family: 'JetBrains Mono', monospace !important;
+    }
+
+    /* ===== EXAMPLES ===== */
+    .examples-table {
+        margin-top: 1.5rem;
+    }
+    
+    .examples-table button {
+        background: var(--bg-glass) !important;
+        border: 1px solid var(--border-subtle) !important;
+        border-radius: var(--radius-md) !important;
+        padding: 0.75rem 1rem !important;
+        font-family: 'Space Grotesk', sans-serif !important;
+        color: var(--text-secondary) !important;
+        transition: all 0.2s ease !important;
+        text-align: left !important;
+    }
+    
+    .examples-table button:hover {
+        background: rgba(99, 102, 241, 0.1) !important;
+        border-color: rgba(99, 102, 241, 0.3) !important;
+        color: var(--text-primary) !important;
+    }
+
+    /* ===== STEP INDICATOR ===== */
+    .setup-steps {
+        display: flex;
+        gap: 1rem;
+        margin-bottom: 2rem;
+    }
+    
+    .step-item {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 1rem;
+        background: var(--bg-glass);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-md);
+        transition: all 0.2s ease;
+    }
+    
+    .step-item.active {
+        border-color: var(--accent-primary);
+        background: rgba(99, 102, 241, 0.1);
+    }
+    
+    .step-item.complete {
+        border-color: var(--success);
+        background: rgba(16, 185, 129, 0.1);
+    }
+    
+    .step-number {
+        width: 32px;
+        height: 32px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: var(--bg-tertiary);
+        border-radius: 50%;
+        font-weight: 600;
+        font-size: 0.9rem;
+        color: var(--text-muted);
+    }
+    
+    .step-item.active .step-number {
+        background: var(--accent-primary);
+        color: white;
+    }
+    
+    .step-item.complete .step-number {
+        background: var(--success);
+        color: white;
+    }
+    
+    .step-text {
+        font-size: 0.9rem;
+        color: var(--text-secondary);
+    }
+    
+    .step-item.active .step-text,
+    .step-item.complete .step-text {
+        color: var(--text-primary);
+    }
+
+    /* ===== LOADING ANIMATION ===== */
+    @keyframes shimmer {
+        0% { background-position: -200% 0; }
+        100% { background-position: 200% 0; }
+    }
+    
+    .loading-shimmer {
+        background: linear-gradient(90deg, var(--bg-tertiary) 25%, var(--bg-secondary) 50%, var(--bg-tertiary) 75%);
+        background-size: 200% 100%;
+        animation: shimmer 1.5s infinite;
+    }
+
+    /* ===== FOOTER ===== */
+    .footer-info {
+        text-align: center;
+        padding: 1.5rem;
+        color: var(--text-muted);
+        font-size: 0.85rem;
+        border-top: 1px solid var(--border-subtle);
+        margin-top: 2rem;
+    }
+    
+    .footer-info a {
+        color: var(--accent-primary);
+        text-decoration: none;
+    }
+    
+    .footer-info a:hover {
+        text-decoration: underline;
+    }
+
+    /* ===== RESPONSIVE ===== */
+    @media (max-width: 768px) {
+        .hero-header h1 {
+            font-size: 1.75rem !important;
+        }
+        
+        .setup-steps {
+            flex-direction: column;
+        }
+    }
+    """
+
+    with gr.Blocks(
+        title="Mac-Scientist | Deep Research Agent",
+        theme=gr.themes.Base(
+            primary_hue="indigo",
+            secondary_hue="purple",
+            neutral_hue="slate",
+            font=["Space Grotesk", "system-ui", "sans-serif"],
+            font_mono=["JetBrains Mono", "monospace"],
+        ).set(
+            body_background_fill="#0a0a0f",
+            body_background_fill_dark="#0a0a0f",
+            block_background_fill="#12121a",
+            block_background_fill_dark="#12121a",
+            block_border_color="rgba(255, 255, 255, 0.08)",
+            block_border_color_dark="rgba(255, 255, 255, 0.08)",
+            input_background_fill="#1a1a24",
+            input_background_fill_dark="#1a1a24",
+            button_primary_background_fill="linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)",
+            button_primary_background_fill_dark="linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)",
+        ),
+        css=custom_css,
     ) as demo:
-        gr.Markdown(
-            f"""
-            # 🔬 Pokee Deep Research Agent
-            
-            An AI agent that performs deep research using multiple tools to answer complex questions.
-            
-            **LLM Serving Mode**: {serving_mode_display}
-            """
-        )
+        
+        # ===== HERO HEADER =====
+        gr.HTML(f"""
+        <div class="hero-header">
+            <h1>🔬 Mac-Scientist</h1>
+            <p class="hero-subtitle">AI-powered deep research agent with web search and analysis capabilities</p>
+            <div class="hero-badges">
+                <span class="badge badge-accent">
+                    <span>⚡</span> {serving_mode_display}
+                </span>
+                {"<span class='badge badge-success'><span>🍎</span> " + platform_badge + "</span>" if platform_badge else ""}
+                {"<span class='badge'><span>💾</span> " + mem_badge + " Unified Memory</span>" if mem_badge else ""}
+                <span class="badge">
+                    <span>🧠</span> PokeeAI/pokee_research_7b
+                </span>
+            </div>
+        </div>
+        """)
 
-        with gr.Tab("🔧 Setup"):
-            gr.Markdown(
-                """
-                ## API Configuration & Tool Server Setup
+        with gr.Tabs() as tabs:
+            # ===== SETUP TAB =====
+            with gr.Tab("⚙️ Setup", id="setup"):
+                gr.HTML("""
+                <div class="setup-steps">
+                    <div class="step-item active" id="step-1">
+                        <div class="step-number">1</div>
+                        <div class="step-text">Configure API Keys</div>
+                    </div>
+                    <div class="step-item" id="step-2">
+                        <div class="step-number">2</div>
+                        <div class="step-text">Start Tool Server</div>
+                    </div>
+                    <div class="step-item" id="step-3">
+                        <div class="step-number">3</div>
+                        <div class="step-text">Begin Research</div>
+                    </div>
+                </div>
+                """)
                 
-                **⚠️ Important**: Configure your API keys and start the tool server before conducting research.
-                
-                ### Required API Keys:
-                - **Serper API**: For web search functionality ([Get key](https://serper.dev))
-                - **Jina AI API**: For web content reading ([Get key](https://jina.ai))
-                - **Gemini API**: For read content summarization with Gemini 2.5 Flash Lite ([Get key](https://aistudio.google.com/app/apikey))
-                """
-            )
-
-            with gr.Row():
-                with gr.Column(scale=2):
-                    gr.Markdown("### 1️⃣ Configure API Keys")
-
+                with gr.Row(equal_height=True):
+                    # API Keys Card
+                    with gr.Column(scale=3):
+                        gr.HTML("""
+                        <div class="card-header">
+                            <div class="card-icon">🔑</div>
+                            <div>
+                                <div class="card-title">API Configuration</div>
+                                <div class="card-subtitle">Connect your external services</div>
+                            </div>
+                        </div>
+                        """)
+                        
+                        with gr.Group():
                     serper_input = gr.Textbox(
-                        label="Serper API Key",
-                        placeholder="Enter your Serper API key...",
+                                label="🔍 Serper API Key",
+                                placeholder="Enter your Serper API key for web search...",
                         type="password",
                         value=os.environ.get("SERPER_API_KEY", ""),
+                                info="Get your key at serper.dev",
                     )
 
                     jina_input = gr.Textbox(
-                        label="Jina AI API Key",
-                        placeholder="Enter your Jina AI API key...",
+                                label="📖 Jina AI API Key",
+                                placeholder="Enter your Jina AI API key for web reading...",
                         type="password",
                         value=os.environ.get("JINA_API_KEY", ""),
+                                info="Get your key at jina.ai",
                     )
 
                     gemini_input = gr.Textbox(
-                        label="Gemini API Key",
-                        placeholder="Enter your Gemini API key...",
+                                label="✨ Gemini API Key",
+                                placeholder="Enter your Gemini API key for summarization...",
                         type="password",
                         value=os.environ.get("GEMINI_API_KEY", ""),
+                                info="Get your key at aistudio.google.com",
                     )
 
                     save_keys_btn = gr.Button(
-                        "💾 Save API Keys", variant="primary", size="lg"
+                            "💾 Save API Keys",
+                            variant="primary",
+                            size="lg",
                     )
                     save_status = gr.Markdown("")
 
-                with gr.Column(scale=1):
-                    gr.Markdown("### 2️⃣ Tool Server Control")
+                    # Server Control Card
+                    with gr.Column(scale=2):
+                        gr.HTML("""
+                        <div class="card-header">
+                            <div class="card-icon">🖥️</div>
+                            <div>
+                                <div class="card-title">Tool Server</div>
+                                <div class="card-subtitle">Manage the research backend</div>
+                            </div>
+                        </div>
+                        """)
+                        
+                        server_status_display = gr.HTML(
+                            value=f"""
+                            <div class="status-pill status-stopped">
+                                <span class="status-dot status-dot-red"></span>
+                                Server Stopped
+                            </div>
+                            """
+                        )
 
                     port_input = gr.Number(
-                        label="Tool Server Port",
+                            label="Server Port",
                         value=tool_server_port,
                         minimum=1024,
                         maximum=65535,
                         step=1,
-                        info="Port number for the tool server (1024-65535)",
-                    )
-
-                    server_status_display = gr.Markdown(
-                        refresh_server_status(), elem_classes=["status-indicator"]
                     )
 
                     with gr.Row():
                         start_server_btn = gr.Button(
-                            "▶️ Start Server", variant="primary", size="lg"
+                                "▶️ Start",
+                                variant="primary",
                         )
                         stop_server_btn = gr.Button(
-                            "⏹️ Stop Server", variant="stop", size="lg"
+                                "⏹️ Stop",
+                                variant="stop",
+                            )
+                        
+                        refresh_status_btn = gr.Button(
+                            "🔄 Refresh Status",
+                            variant="secondary",
+                            size="sm",
                         )
-
-                    refresh_status_btn = gr.Button("🔄 Refresh Status", size="sm")
 
                     server_message = gr.Markdown("")
 
-            gr.Markdown(
-                """
-                ---
-                ### 📝 Setup Checklist:
-                
-                1. ✅ Enter your API keys above
-                2. ✅ Click "Save API Keys"
-                3. ✅ Configure tool server port (if needed)
-                4. ✅ Click "Start Server" and wait for green status
-                5. ✅ Go to "Research" tab to start asking questions
-                """
-            )
-
-        with gr.Tab("🔍 Research"):
+            # ===== RESEARCH TAB =====
+            with gr.Tab("🔬 Research", id="research"):
+                with gr.Row(equal_height=False):
+                    # Input Column
+                    with gr.Column(scale=2):
+                        gr.HTML("""
+                        <div class="card-header">
+                            <div class="card-icon">❓</div>
+                            <div>
+                                <div class="card-title">Research Query</div>
+                                <div class="card-subtitle">Ask any question requiring deep research</div>
+                            </div>
+                        </div>
+                        """)
+                        
+                        question_input = gr.Textbox(
+                            label="",
+                            placeholder="What would you like to research today? Ask complex questions that require searching and analyzing multiple sources...",
+                            lines=4,
+                            show_label=False,
+                        )
+                        
             with gr.Row():
-                with gr.Column(scale=2):
-                    question_input = gr.Textbox(
-                        label="Question",
-                        placeholder="Enter your research question here...",
-                        lines=3,
-                    )
-
-                    with gr.Accordion("Advanced Settings", open=False):
+                            submit_btn = gr.Button(
+                                "🚀 Start Research",
+                                variant="primary",
+                                size="lg",
+                            )
+                            cancel_btn = gr.Button(
+                                "⛔ Cancel",
+                                variant="stop",
+                                size="lg",
+                            )
+                        
+                        with gr.Accordion("⚙️ Advanced Parameters", open=False):
                         temperature_slider = gr.Slider(
                             minimum=0.0,
                             maximum=1.0,
                             value=0.1,
                             step=0.1,
                             label="Temperature",
-                            info="Higher values = more creative, lower = more focused",
+                                info="Lower = focused & consistent, Higher = creative & varied",
                         )
                         top_p_slider = gr.Slider(
                             minimum=0.0,
                             maximum=1.0,
                             value=0.1,
                             step=0.05,
-                            label="Top P",
-                            info="Nucleus sampling threshold",
+                                label="Top P (Nucleus Sampling)",
+                                info="Controls diversity of token selection",
                         )
                         max_turns_research = gr.Slider(
                             minimum=1,
                             maximum=30,
                             value=10,
                             step=1,
-                            label="Max Turns",
-                            info="Maximum research iterations",
+                                label="Max Research Iterations",
+                                info="More iterations = deeper research but longer time",
+                            )
+                        
+                        gr.HTML("<div style='margin-top: 1.5rem'><strong style='color: var(--text-secondary); font-size: 0.85rem;'>💡 TRY THESE EXAMPLES</strong></div>")
+                        
+                        gr.Examples(
+                            examples=[
+                                ["What are the latest breakthroughs in quantum computing in 2024?"],
+                                ["Compare the economic policies of the G7 nations on climate change"],
+                                ["Explain the scientific consensus on microplastics in drinking water"],
+                                ["What is the current state of nuclear fusion energy research?"],
+                            ],
+                            inputs=question_input,
+                            label="",
                         )
-
-                    with gr.Row():
-                        submit_btn = gr.Button(
-                            "🔍 Research", variant="primary", size="lg"
-                        )
-                        cancel_btn = gr.Button("⛔ Cancel", variant="stop", size="lg")
-
-                with gr.Column(scale=2):
-                    with gr.Group(elem_classes=["progress-box-container"]):
+                    
+                    # Output Column
+                    with gr.Column(scale=3):
+                        gr.HTML("""
+                        <div class="card-header">
+                            <div class="card-icon">📊</div>
+                            <div>
+                                <div class="card-title">Research Progress</div>
+                                <div class="card-subtitle">Real-time activity timeline</div>
+                            </div>
+                        </div>
+                        """)
+                        
                         progress_output = gr.Markdown(
-                            value="***Research progress will appear here...***",
-                            elem_classes=["progress-box"],
+                            value="""
+<div class="progress-empty">
+    <div class="progress-empty-icon">🔬</div>
+    <div><strong>Ready to Research</strong></div>
+    <div style="margin-top: 0.5rem; font-size: 0.9rem;">Enter a question and click "Start Research" to begin</div>
+</div>
+                            """,
+                            elem_classes=["research-progress"],
+                        )
+                        
+                        gr.HTML("""
+                        <div class="answer-container">
+                            <div class="answer-label">
+                                <span>✅</span> Research Findings
+                            </div>
+                        </div>
+                        """)
+                        
+                    answer_output = gr.Textbox(
+                            label="",
+                            lines=8,
+                            max_lines=15,
+                            show_label=False,
+                        show_copy_button=True,
+                            placeholder="The final answer will appear here after research is complete...",
                         )
 
-                    answer_output = gr.Textbox(
-                        label="Answer",
-                        lines=10,
-                        max_lines=20,
-                        show_copy_button=True,
-                    )
+            # ===== ABOUT TAB =====
+            with gr.Tab("📚 About", id="about"):
+                gr.HTML("""
+                <div style="max-width: 800px; margin: 0 auto;">
+                    <div class="card-header">
+                        <div class="card-icon">🧠</div>
+                        <div>
+                            <div class="card-title">How It Works</div>
+                            <div class="card-subtitle">Understanding the research process</div>
+                        </div>
+                    </div>
+                    
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin: 1.5rem 0;">
+                        <div class="glass-card" style="text-align: center; padding: 1.5rem;">
+                            <div style="font-size: 2rem; margin-bottom: 0.75rem;">🔍</div>
+                            <div style="font-weight: 600; color: var(--text-primary); margin-bottom: 0.25rem;">Search</div>
+                            <div style="font-size: 0.85rem; color: var(--text-muted);">Queries multiple sources for relevant information</div>
+                        </div>
+                        <div class="glass-card" style="text-align: center; padding: 1.5rem;">
+                            <div style="font-size: 2rem; margin-bottom: 0.75rem;">📖</div>
+                            <div style="font-weight: 600; color: var(--text-primary); margin-bottom: 0.25rem;">Read</div>
+                            <div style="font-size: 0.85rem; color: var(--text-muted);">Analyzes web content in depth</div>
+                        </div>
+                        <div class="glass-card" style="text-align: center; padding: 1.5rem;">
+                            <div style="font-size: 2rem; margin-bottom: 0.75rem;">🧪</div>
+                            <div style="font-weight: 600; color: var(--text-primary); margin-bottom: 0.25rem;">Analyze</div>
+                            <div style="font-size: 0.85rem; color: var(--text-muted);">Synthesizes findings into insights</div>
+                        </div>
+                        <div class="glass-card" style="text-align: center; padding: 1.5rem;">
+                            <div style="font-size: 2rem; margin-bottom: 0.75rem;">✅</div>
+                            <div style="font-weight: 600; color: var(--text-primary); margin-bottom: 0.25rem;">Verify</div>
+                            <div style="font-size: 0.85rem; color: var(--text-muted);">Cross-references for accuracy</div>
+                        </div>
+                    </div>
+                    
+                    <div class="glass-card" style="margin-top: 2rem;">
+                        <h3 style="margin: 0 0 1rem 0; color: var(--text-primary);">🎯 Best Practices</h3>
+                        <ul style="color: var(--text-secondary); line-height: 1.8; padding-left: 1.5rem;">
+                            <li><strong>Be specific</strong> — Include context and constraints in your questions</li>
+                            <li><strong>Complex queries</strong> — This agent excels at multi-step research requiring multiple sources</li>
+                            <li><strong>Adjust iterations</strong> — Increase max turns for deeper topics, decrease for simple lookups</li>
+                            <li><strong>Temperature 0.1</strong> — Best for factual research; higher values for creative exploration</li>
+                            <li><strong>Watch the timeline</strong> — Follow along as the agent searches and reads sources</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="glass-card" style="margin-top: 1.5rem;">
+                        <h3 style="margin: 0 0 1rem 0; color: var(--text-primary);">🛠️ Technical Stack</h3>
+                        <div style="display: flex; flex-wrap: wrap; gap: 0.5rem;">
+                            <span class="badge">PokeeAI Research 7B</span>
+                            <span class="badge">MLX / MPS</span>
+                            <span class="badge">Serper Search API</span>
+                            <span class="badge">Jina Reader</span>
+                            <span class="badge">Gemini Flash</span>
+                            <span class="badge badge-accent">Apple Silicon Optimized</span>
+                        </div>
+                    </div>
+                </div>
+                """)
+        
+        # Footer
+        gr.HTML("""
+        <div class="footer-info">
+            Built with 🔬 by <a href="https://pokee.ai" target="_blank">Pokee AI</a> • 
+            Optimized for Apple Silicon • 
+            <a href="https://github.com/Pokee-AI/PokeeResearchOSS" target="_blank">GitHub</a>
+        </div>
+        """)
 
-            gr.Examples(
-                examples=[
-                    ["What is the capital of France?"],
-                    ["Who won the 2024 Nobel Prize in Physics?"],
-                    ["What are the latest developments in quantum computing?"],
-                ],
-                inputs=question_input,
-            )
-
-        with gr.Tab("ℹ️ About"):
-            gr.Markdown(
+        # ===== EVENT HANDLERS =====
+        
+        def update_server_status_html(is_running: bool, message: str) -> str:
+            if is_running:
+                return f"""
+                <div class="status-pill status-running">
+                    <span class="status-dot status-dot-green"></span>
+                    {message}
+                </div>
                 """
-                ## About Deep Research Agent
-                
-                This AI agent performs comprehensive research on your questions by:
-                1. **Searching** for relevant information using web search
-                2. **Reading** and analyzing web content
-                3. **Verifying** answers for accuracy
-                4. **Iterating** until a satisfactory answer is found
-                
-                ### Usage Tips
-                
-                - **Setup First**: Always configure API keys and start the tool server in the Setup tab
-                - **Complex questions** may require more turns (adjust in Advanced Settings)
-                - **Temperature**: Lower (0.1) = more focused, Higher (1.0) = more creative
-                - **Cancellation**: Use the Cancel button to stop long-running research
-                - **Progress tracking**: Watch the Research Progress panel for real-time updates
-                
-                ### Features
-                
-                - ✅ Secure API key management
-                - ✅ Manual tool server control
-                - ✅ Multiple concurrent users supported
-                - ✅ Independent session management
-                - ✅ Real-time progress updates
-                - ✅ Graceful cancellation and cleanup
-                - ✅ Live research progress tracking with tool visibility
+            else:
+                return f"""
+                <div class="status-pill status-stopped">
+                    <span class="status-dot status-dot-red"></span>
+                    {message}
+                </div>
                 """
-            )
-
-        # Event handlers for Setup tab
+        
+        def refresh_status_html() -> str:
+            status = get_tool_server_status()
+            return update_server_status_html(status["running"], "Running" if status["running"] else "Stopped")
+        
+        def start_server_with_html(port: int) -> tuple[str, str]:
+            msg, _ = start_tool_server_ui(port)
+            status = get_tool_server_status()
+            html = update_server_status_html(status["running"], "Running" if status["running"] else "Stopped")
+            return msg, html
+        
+        def stop_server_with_html() -> tuple[str, str]:
+            msg, _ = stop_tool_server_ui()
+            return msg, update_server_status_html(False, "Stopped")
+        
         save_keys_btn.click(
             fn=save_api_keys,
             inputs=[serper_input, jina_input, gemini_input],
@@ -787,24 +1684,23 @@ def create_demo():
         )
 
         start_server_btn.click(
-            fn=start_tool_server_ui,
+            fn=start_server_with_html,
             inputs=[port_input],
             outputs=[server_message, server_status_display],
         )
 
         stop_server_btn.click(
-            fn=stop_tool_server_ui,
+            fn=stop_server_with_html,
             inputs=[],
             outputs=[server_message, server_status_display],
         )
 
         refresh_status_btn.click(
-            fn=refresh_server_status,
+            fn=refresh_status_html,
             inputs=[],
             outputs=[server_status_display],
         )
 
-        # Event handlers for Research tab
         submit_event = submit_btn.click(
             fn=research_stream,
             inputs=[
@@ -832,10 +1728,14 @@ def main():
     """Main entry point for the Gradio application.
 
     Parses command-line arguments, configures the agent backend, optionally
-    pre-loads models (for local mode), and launches the Gradio interface.
+    pre-loads models (for local/mlx modes), and launches the Gradio interface.
     Registers cleanup handlers for graceful shutdown.
     """
     global tool_server_proc
+
+    # Determine best defaults based on platform
+    default_mode = "mlx" if is_apple_silicon() else "local"
+    default_device = get_default_device()
 
     parser = argparse.ArgumentParser(
         description="Pokee Deep Research Agent - Web Interface"
@@ -843,15 +1743,25 @@ def main():
     parser.add_argument(
         "--serving-mode",
         type=str,
-        choices=["local", "vllm"],
-        default="local",
-        help="Serving mode: 'local' (single GPU) or 'vllm' (server-based)",
+        choices=["local", "mlx", "mlx-server", "vllm"],
+        default=default_mode,
+        help=f"Serving mode (default: {default_mode}). "
+             "'local' = HuggingFace Transformers, "
+             "'mlx' = Apple Silicon native, "
+             "'mlx-server' = MLX-LM server, "
+             "'vllm' = vLLM server",
     )
     parser.add_argument(
         "--vllm-url",
         type=str,
         default="http://localhost:9999/v1",
-        help="VLLM server URL (required for --serving-mode vllm)",
+        help="vLLM server URL (for --serving-mode vllm)",
+    )
+    parser.add_argument(
+        "--mlx-server-url",
+        type=str,
+        default="http://localhost:8080/v1",
+        help="MLX-LM server URL (for --serving-mode mlx-server)",
     )
     parser.add_argument(
         "--model-path",
@@ -864,6 +1774,13 @@ def main():
         type=str,
         default="config/tool_config/pokee_tool_config.yaml",
         help="Tool configuration file path",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=default_device,
+        choices=["auto", "cuda", "mps", "cpu"],
+        help=f"Device for local mode (default: {default_device})",
     )
     parser.add_argument(
         "--share",
@@ -879,31 +1796,40 @@ def main():
 
     args = parser.parse_args()
 
+    # Validate mode-specific requirements
+    if args.serving_mode == "vllm" and not args.vllm_url:
+        parser.error("--vllm-url is required when using --serving-mode vllm")
+    
+    if args.serving_mode == "mlx" and not is_apple_silicon():
+        parser.error("--serving-mode mlx requires Apple Silicon (M1/M2/M3)")
+
     # Configure global settings
     global serving_mode, agent_config
     serving_mode = args.serving_mode
     agent_config = {
         "model_path": args.model_path,
-        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "device": args.device,
         "max_turns": 10,
         "tool_config_path": args.tool_config,
         "vllm_url": args.vllm_url if args.serving_mode == "vllm" else None,
+        "mlx_server_url": args.mlx_server_url if args.serving_mode == "mlx-server" else None,
     }
 
-    # Validate configuration
-    if args.serving_mode == "vllm" and not args.vllm_url:
-        parser.error("--vllm-url is required when using --serving-mode vllm")
+    # Log platform info
+    if is_apple_silicon():
+        mem_gb = get_system_memory_gb()
+        logger.info(f"Apple Silicon detected - {mem_gb:.0f}GB unified memory")
 
     logger.info(f"Starting Gradio app with {args.serving_mode.upper()} serving mode")
     logger.info(f"Configuration: {agent_config}")
 
-    # Pre-initialize resources for local agent
-    if args.serving_mode == "local":
+    # Pre-initialize resources for local/mlx agents
+    if args.serving_mode in ["local", "mlx"]:
         logger.info("Pre-loading model...")
         create_agent()
         logger.info("Model loaded successfully!")
     else:
-        logger.info("Using VLLM server (no pre-loading needed)")
+        logger.info(f"Using {args.serving_mode.upper()} server (no pre-loading needed)")
 
     # Register cleanup handler for tool server
     atexit.register(cleanup_tool_server, tool_server_proc)
